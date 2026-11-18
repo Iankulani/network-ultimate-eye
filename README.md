@@ -1,5 +1,8 @@
 # network-ultimate-eye
 
+
+<div align="center">
+
 <img width="360" height="360" alt="acd_origami_eye" src="https://github.com/user-attachments/assets/2bacf7a1-796c-4683-b553-460847f37d2e" />
 
 [![GitHub stars](https://img.shields.io/github/stars/Iankulani/network-ultimate-eye?style=for-the-badge&logo=github)](https://github.com/Iankulani/network-ultimate-eye/stargazers)
@@ -22,6 +25,10 @@
 [![Blue Team](https://img.shields.io/badge/Blue%20Team-Operations-1E90FF?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Iankulani/network-ultimate-eye)
 [![Purple Team](https://img.shields.io/badge/Purple%20Team-Operations-800080?style=for-the-badge&logo=shield&logoColor=white)](https://github.com/Iankulani/network-ultimate-eye)
 [![GitLab CI](https://img.shields.io/badge/GitLab%20CI-Pipeline-FC6D26?style=for-the-badge&logo=gitlab&logoColor=white)](https://github.com/Iankulani/network-ultimate-eye)
+
+</div>
+
+
 
 Network ultimate eye
 
