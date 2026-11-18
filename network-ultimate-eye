@@ -1,0 +1,2189 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nuE - Network Threat Monitoring Platform  (single source file, Python 3.8+)
+
+Defensive tool: use ONLY on networks and hosts you own or are authorised to test.
+
+Features (all real - no simulated detections):
+  * Many IP targets (single IP, ranges, CIDR) - scan & monitor them all
+  * Threaded TCP port scanner with banner grabbing and service/risk rating
+  * DoS detection: connection-flood per source IP, SYN-flood (SYN_RECV) counts,
+    target availability loss and latency shifts
+  * Change point detection (two-sided CUSUM) on latency and connection counts
+  * Baseline diffing: alert when a new port opens on a target
+  * Attack path analysis: Dijkstra shortest exploit path Internet -> critical asset
+  * Open-port bar + pie charts, exported as SVG / PNG (matplotlib) / PostScript
+  * SOC analyst management: analysts, on-call, incidents, auto-assignment, notes
+  * Integrations: Discord, Slack, Google Chat, Telegram, Signal (alerts out,
+    commands in via Telegram/Signal polling and web endpoints for Slack/Google Chat)
+  * Web application dashboard (built-in HTTP server, token protected)
+  * Tkinter GUI (blue theme, full menu bar) and a CLI
+
+Run:  python nue.py            (GUI)        python nue.py --help   (CLI)
+"""
+
+import os, sys, re, json, csv, time, math, socket, hmac, html, queue, heapq, secrets
+import hashlib, argparse, ipaddress, threading, subprocess, datetime, urllib.request
+import urllib.parse
+from collections import deque, Counter
+from concurrent.futures import ThreadPoolExecutor
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+APP = "nuE"
+VERSION = "1.0"
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".nue")
+DB_PATH = os.path.join(DATA_DIR, "nue.json")
+
+# ---------------------------------------------------------------- theme ----
+BG, PANEL, PANEL2 = "#0a1a33", "#102a52", "#16386b"
+ACCENT, ACCENT2 = "#2f80ed", "#56a0ff"
+FG, MUTED, BORDER = "#e6efff", "#8fa9d6", "#1e4580"
+OKC, WARNC, BADC = "#34d399", "#fbbf24", "#f87171"
+PALETTE = ["#2f80ed", "#56a0ff", "#1e5bb8", "#7cc0ff", "#0f3f8c", "#9bd0ff",
+           "#3b6fd1", "#6fa8ff", "#264f9e", "#b3dcff", "#4a90e2", "#1c3f7a"]
+
+SEV = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+SEV_COLOR = {"low": OKC, "medium": WARNC, "high": "#fb923c", "critical": BADC}
+
+COMMON_PORTS = {
+    20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 67: "dhcp",
+    69: "tftp", 80: "http", 88: "kerberos", 110: "pop3", 111: "rpcbind", 123: "ntp",
+    135: "msrpc", 137: "netbios-ns", 139: "netbios-ssn", 143: "imap", 161: "snmp",
+    389: "ldap", 443: "https", 445: "smb", 465: "smtps", 514: "syslog", 587: "submission",
+    636: "ldaps", 993: "imaps", 995: "pop3s", 1433: "mssql", 1521: "oracle", 2049: "nfs",
+    2375: "docker", 3306: "mysql", 3389: "rdp", 5432: "postgres", 5900: "vnc",
+    5985: "winrm", 5986: "winrm-ssl", 6379: "redis", 8000: "http-alt", 8080: "http-proxy",
+    8443: "https-alt", 9200: "elasticsearch", 11211: "memcached", 27017: "mongodb",
+}
+# exploitability / exposure risk 1..10 per service (used for ratings and attack paths)
+RISK = {
+    "telnet": 9, "ftp": 7, "ftp-data": 5, "smb": 9, "msrpc": 7, "netbios-ssn": 7,
+    "netbios-ns": 5, "rdp": 9, "vnc": 8, "mssql": 8, "mysql": 7, "postgres": 7,
+    "oracle": 7, "redis": 9, "mongodb": 9, "elasticsearch": 8, "memcached": 8,
+    "docker": 10, "snmp": 6, "nfs": 7, "tftp": 7, "rpcbind": 6, "smtp": 4, "pop3": 5,
+    "imap": 4, "ssh": 4, "winrm": 7, "winrm-ssl": 6, "ldap": 5, "http": 3,
+    "http-alt": 4, "http-proxy": 4, "https": 2, "https-alt": 3, "dns": 3, "ntp": 2,
+    "kerberos": 3, "ldaps": 2, "imaps": 2, "pop3s": 2, "smtps": 2, "submission": 2,
+    "syslog": 3, "dhcp": 2,
+}
+LATERAL_SERVICES = {"ssh", "msrpc", "netbios-ssn", "smb", "rdp", "vnc", "winrm",
+                    "winrm-ssl", "telnet", "nfs", "docker"}
+HTTP_PORTS = {80, 8000, 8080, 8443, 443}
+DEFAULT_PORTS = "1-1024,1433,1521,2049,2375,3306,3389,5432,5900,5985,6379,8000,8080,8443,9200,11211,27017"
+
+DEFAULTS = {
+    "targets": [], "alerts": [], "analysts": [], "incidents": [], "scans": {},
+    "baseline": {}, "counters": {"alert": 0, "incident": 0, "analyst": 0},
+    "settings": {
+        "ports": DEFAULT_PORTS, "timeout": 0.8, "threads": 200, "monitor_interval": 10,
+        "rescan_every": 6, "dos_conn_per_ip": 150, "dos_syn_recv": 60,
+        "cusum_k": 0.5, "cusum_h": 6.0, "alert_cooldown": 120,
+        "min_notify_severity": "medium", "auto_incident": True,
+        "probe_ports": "80,443,22",
+        "discord_enabled": False, "discord_webhook": "",
+        "slack_enabled": False, "slack_webhook": "", "slack_signing_secret": "",
+        "gchat_enabled": False, "gchat_webhook": "",
+        "telegram_enabled": False, "telegram_token": "", "telegram_chat_id": "",
+        "signal_enabled": False, "signal_url": "http://127.0.0.1:8080",
+        "signal_number": "", "signal_recipients": "",
+        "web_enabled": False, "web_host": "127.0.0.1", "web_port": 8765, "web_token": "",
+    },
+}
+
+
+def now_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ------------------------------------------------------------- utilities ----
+def parse_ports(spec):
+    ports = set()
+    for tok in re.split(r"[,\s;]+", str(spec).strip()):
+        if not tok:
+            continue
+        if "-" in tok:
+            a, b = tok.split("-", 1)
+            a, b = int(a), int(b)
+            if not (1 <= a <= b <= 65535):
+                raise ValueError("bad port range: " + tok)
+            ports.update(range(a, b + 1))
+        else:
+            p = int(tok)
+            if not 1 <= p <= 65535:
+                raise ValueError("bad port: " + tok)
+            ports.add(p)
+    return sorted(ports)
+
+
+def parse_targets(text):
+    """Accepts: 10.0.0.5  10.0.0.1-20  10.0.0.1-10.0.0.9  192.168.1.0/24  (comma/space/newline separated)."""
+    out = []
+    for tok in re.split(r"[,\s;]+", text.strip()):
+        if not tok:
+            continue
+        if "/" in tok:
+            net = ipaddress.ip_network(tok, strict=False)
+            hosts = list(net.hosts()) if net.num_addresses > 2 else list(net)
+            if len(hosts) > 1024:
+                raise ValueError("CIDR too large (max 1024 hosts): " + tok)
+            out += [str(h) for h in hosts]
+        elif "-" in tok:
+            a, b = tok.split("-", 1)
+            s = ipaddress.ip_address(a)
+            if "." in b or ":" in b:
+                e = ipaddress.ip_address(b)
+            else:
+                e = ipaddress.ip_address(a.rsplit(".", 1)[0] + "." + b)
+            if type(s) is not type(e) or int(e) < int(s) or int(e) - int(s) > 1023:
+                raise ValueError("bad range: " + tok)
+            out += [str(type(s)(n)) for n in range(int(s), int(e) + 1)]
+        else:
+            out.append(str(ipaddress.ip_address(tok)))
+    seen, res = set(), []
+    for ip in out:
+        if ip not in seen:
+            seen.add(ip)
+            res.append(ip)
+    return res
+
+
+def service_name(port):
+    if port in COMMON_PORTS:
+        return COMMON_PORTS[port]
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "unknown"
+
+
+def risk_of(service):
+    return RISK.get(service, 2)
+
+
+def http_post(url, payload, headers=None, timeout=10, form=False):
+    if form:
+        body = urllib.parse.urlencode(payload).encode()
+        ctype = "application/x-www-form-urlencoded"
+    else:
+        body = json.dumps(payload).encode()
+        ctype = "application/json"
+    h = {"Content-Type": ctype, "User-Agent": "nuE/" + VERSION}
+    h.update(headers or {})
+    req = urllib.request.Request(url, data=body, headers=h, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+# ------------------------------------------------------------------ store ---
+class Store:
+    def __init__(self, path=DB_PATH):
+        self.path = path
+        self.lock = threading.RLock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.data = self._load()
+
+    def _load(self):
+        data = json.loads(json.dumps(DEFAULTS))
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                for k, v in saved.items():
+                    if k == "settings":
+                        data["settings"].update(v)
+                    else:
+                        data[k] = v
+            except (OSError, ValueError):
+                pass
+        if not data["settings"].get("web_token"):
+            data["settings"]["web_token"] = secrets.token_urlsafe(18)
+        return data
+
+    def save(self):
+        with self.lock:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=1)
+            os.replace(tmp, self.path)
+
+    def next_id(self, kind):
+        with self.lock:
+            self.data["counters"][kind] = self.data["counters"].get(kind, 0) + 1
+            return self.data["counters"][kind]
+
+    @property
+    def settings(self):
+        return self.data["settings"]
+
+
+# ------------------------------------------------------------ port scanner --
+def probe_port(ip, port, timeout, grab=True):
+    fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    t0 = time.perf_counter()
+    try:
+        if s.connect_ex((ip, port)) != 0:
+            return None
+        lat = (time.perf_counter() - t0) * 1000.0
+        banner = ""
+        if grab:
+            try:
+                if port in HTTP_PORTS and port != 443 and port != 8443:
+                    s.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+                s.settimeout(0.4)
+                raw = s.recv(160).decode("latin-1", "replace").strip()
+                banner = raw.splitlines()[0][:90] if raw else ""
+            except OSError:
+                pass
+        return {"port": port, "latency": round(lat, 2), "banner": banner}
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def scan_host(ip, ports, timeout=0.8, threads=200, progress=None, stop=None):
+    results, done = [], [0]
+    lock = threading.Lock()
+
+    def work(p):
+        if stop is not None and stop.is_set():
+            return
+        r = probe_port(ip, p, timeout)
+        with lock:
+            done[0] += 1
+            if r:
+                svc = service_name(p)
+                r["service"] = svc
+                r["risk"] = risk_of(svc)
+                results.append(r)
+            if progress and done[0] % 64 == 0:
+                progress(done[0], len(ports))
+
+    with ThreadPoolExecutor(max_workers=max(1, min(threads, len(ports)))) as ex:
+        list(ex.map(work, ports))
+    if progress:
+        progress(len(ports), len(ports))
+    return sorted(results, key=lambda r: r["port"])
+
+
+# ---------------------------------------------------- connection tracking ---
+TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1",
+              "05": "FIN_WAIT2", "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT",
+              "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING"}
+
+
+def _hex_ip(h):
+    if len(h) == 8:
+        return socket.inet_ntoa(bytes.fromhex(h)[::-1])
+    chunks = [bytes.fromhex(h[i:i + 8])[::-1] for i in range(0, 32, 8)]
+    return socket.inet_ntop(socket.AF_INET6, b"".join(chunks))
+
+
+def local_connections():
+    """Returns list of (state, local_ip, local_port, remote_ip, remote_port). Real data from the OS."""
+    conns = []
+    try:
+        import psutil  # optional
+        for c in psutil.net_connections(kind="tcp"):
+            if c.raddr:
+                conns.append((c.status, c.laddr.ip, c.laddr.port, c.raddr.ip, c.raddr.port))
+            elif c.status:
+                conns.append((c.status, c.laddr.ip, c.laddr.port, "", 0))
+        return conns
+    except Exception:
+        pass
+    if os.path.exists("/proc/net/tcp"):
+        for fn in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(fn) as f:
+                    next(f)
+                    for line in f:
+                        p = line.split()
+                        lip, lport = p[1].split(":")
+                        rip, rport = p[2].split(":")
+                        conns.append((TCP_STATES.get(p[3], p[3]), _hex_ip(lip), int(lport, 16),
+                                      _hex_ip(rip), int(rport, 16)))
+            except (OSError, ValueError, StopIteration):
+                continue
+        return conns
+    try:
+        out = subprocess.run(["netstat", "-an"], capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return conns
+    states = set(TCP_STATES.values()) | {"SYN_RCVD", "ESTAB"}
+    for line in out.splitlines():
+        t = line.split()
+        st = next((x for x in t if x.upper() in states), None)
+        if not st or len(t) < 4:
+            continue
+        i = t.index(st)
+        loc, rem = t[i - 2], t[i - 1]
+
+        def sp(a):
+            a = a.replace("[", "").replace("]", "")
+            if ":" in a and a.count(":") == 1 or a.count(".") == 4:
+                a, _, p = a.rpartition(":" if ":" in a else ".")
+            else:
+                a, _, p = a.rpartition(":")
+            return a, int(p) if p.isdigit() else 0
+        li, lp = sp(loc)
+        ri, rp = sp(rem)
+        conns.append(("SYN_RECV" if st.upper() == "SYN_RCVD" else st.upper(), li, lp, ri, rp))
+    return conns
+
+
+# ---------------------------------------------------- change point (CUSUM) --
+class CUSUM:
+    """Two-sided tabular CUSUM on standardised values with a warm-up baseline."""
+
+    def __init__(self, k=0.5, h=6.0, warm=12):
+        self.k, self.h, self.warm = k, h, warm
+        self.reset()
+
+    def reset(self):
+        self.n, self.mean, self.m2, self.sp, self.sn = 0, 0.0, 0.0, 0.0, 0.0
+
+    def _welford(self, x):
+        self.n += 1
+        d = x - self.mean
+        self.mean += d / self.n
+        self.m2 += d * (x - self.mean)
+
+    def update(self, x):
+        """returns +1 (upward shift), -1 (downward shift) or 0"""
+        if self.n < self.warm:
+            self._welford(x)
+            return 0
+        sd = max(math.sqrt(self.m2 / max(1, self.n - 1)), 0.05 * abs(self.mean), 1e-6)
+        z = (x - self.mean) / sd
+        self.sp = max(0.0, self.sp + z - self.k)
+        self.sn = max(0.0, self.sn - z - self.k)
+        if self.sp > self.h:
+            self.reset()
+            self._welford(x)
+            return 1
+        if self.sn > self.h:
+            self.reset()
+            self._welford(x)
+            return -1
+        if self.sp == 0 and self.sn == 0 and self.n < 500:
+            self._welford(x)
+        return 0
+
+
+def change_points(values, k=0.5, h=6.0, warm=12):
+    c = CUSUM(k, h, warm)
+    return [(i, d) for i, v in enumerate(values) for d in [c.update(v)] if d]
+
+
+# -------------------------------------------------------- attack path graph -
+def build_attack_graph(store):
+    """Nodes: 'Internet' + scanned hosts. Edge cost = 11 - exploitability (lower = easier)."""
+    edges = {"Internet": []}
+    hosts = {}
+    for ip, sc in store.data["scans"].items():
+        if any(t["ip"] == ip for t in store.data["targets"]):
+            hosts[ip] = sc.get("open", [])
+    for ip in hosts:
+        edges.setdefault(ip, [])
+    for ip, ports in hosts.items():
+        if ports:
+            best = max(ports, key=lambda p: p.get("risk", 2))
+            edges["Internet"].append((ip, max(1, 11 - best["risk"]),
+                                      "exploit %s/%d" % (best["service"], best["port"])))
+
+    def same_net(a, b):
+        A, B = ipaddress.ip_address(a), ipaddress.ip_address(b)
+        if A.version != B.version:
+            return False
+        return ipaddress.ip_network("%s/%d" % (a, 24 if A.version == 4 else 64), strict=False) \
+            == ipaddress.ip_network("%s/%d" % (b, 24 if B.version == 4 else 64), strict=False)
+
+    for a in hosts:
+        for b, ports in hosts.items():
+            if a == b or not same_net(a, b):
+                continue
+            lat = [p for p in ports if p["service"] in LATERAL_SERVICES]
+            if lat:
+                best = max(lat, key=lambda p: p.get("risk", 2))
+                edges[a].append((b, max(1, 11 - best["risk"]) + 1,
+                                 "pivot via %s/%d" % (best["service"], best["port"])))
+    return edges
+
+
+def shortest_path(edges, src, dst):
+    dist, prev = {src: 0}, {}
+    pq = [(0, src)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u == dst:
+            break
+        if d > dist.get(u, 1e18):
+            continue
+        for v, w, why in edges.get(u, []):
+            nd = d + w
+            if nd < dist.get(v, 1e18):
+                dist[v] = nd
+                prev[v] = (u, why)
+                heapq.heappush(pq, (nd, v))
+    if dst not in dist:
+        return None, None
+    path, cur = [], dst
+    while cur != src:
+        u, why = prev[cur]
+        path.append((u, cur, why))
+        cur = u
+    return list(reversed(path)), dist[dst]
+
+
+def attack_paths(store):
+    edges = build_attack_graph(store)
+    crit = [t["ip"] for t in store.data["targets"] if t.get("critical")]
+    goals = crit or [t["ip"] for t in store.data["targets"]]
+    res = []
+    for g in goals:
+        if g in edges:
+            path, cost = shortest_path(edges, "Internet", g)
+            if path:
+                res.append({"target": g, "critical": g in crit, "cost": cost, "path": path})
+    res.sort(key=lambda r: (not r["critical"], r["cost"]))
+    return res, edges
+
+
+def format_paths(paths):
+    if not paths:
+        return "No attack path found (scan targets first, or no exposed services lead to the goal)."
+    lines = []
+    for r in paths:
+        lines.append("%s target %s  (ease cost %d - lower is easier)" %
+                     ("CRITICAL" if r["critical"] else "Host", r["target"], r["cost"]))
+        for i, (a, b, why) in enumerate(r["path"], 1):
+            lines.append("   %d. %s -> %s   [%s]" % (i, a, b, why))
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ charts --
+def port_stats(store, ip=None):
+    ports, svcs = Counter(), Counter()
+    for h, sc in store.data["scans"].items():
+        if ip and h != ip:
+            continue
+        for p in sc.get("open", []):
+            ports["%d/%s" % (p["port"], p["service"])] += 1
+            svcs[p["service"]] += 1
+    bar = ports.most_common(12)
+    pie = svcs.most_common(8)
+    rest = sum(svcs.values()) - sum(v for _, v in pie)
+    if rest > 0:
+        pie.append(("other", rest))
+    return bar, pie
+
+
+def bar_svg(title, data, w=760, h=440):
+    o = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">' % (w, h, w, h),
+         '<rect width="100%%" height="100%%" fill="%s"/>' % BG,
+         '<text x="%d" y="28" fill="%s" font-family="Arial" font-size="18" text-anchor="middle">%s</text>'
+         % (w // 2, FG, html.escape(title))]
+    if data:
+        mx = max(v for _, v in data)
+        L, R, T, B = 55, 20, 50, 80
+        pw, ph = w - L - R, h - T - B
+        bw = pw / len(data)
+        for g in range(0, 5):
+            y = T + ph - ph * g / 4
+            o.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s"/>' % (L, y, w - R, y, BORDER))
+            o.append('<text x="%d" y="%.1f" fill="%s" font-size="11" text-anchor="end" font-family="Arial">%.0f</text>'
+                     % (L - 6, y + 4, MUTED, mx * g / 4))
+        for i, (lab, v) in enumerate(data):
+            x0 = L + i * bw + bw * 0.15
+            bwid = bw * 0.7
+            bh = ph * v / mx
+            o.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s"/>'
+                     % (x0, T + ph - bh, bwid, bh, PALETTE[i % len(PALETTE)]))
+            o.append('<text x="%.1f" y="%.1f" fill="%s" font-size="12" text-anchor="middle" font-family="Arial">%d</text>'
+                     % (x0 + bwid / 2, T + ph - bh - 6, FG, v))
+            o.append('<text x="%.1f" y="%.1f" fill="%s" font-size="11" text-anchor="end" font-family="Arial" '
+                     'transform="rotate(-40 %.1f %.1f)">%s</text>'
+                     % (x0 + bwid / 2 + 6, T + ph + 16, FG, x0 + bwid / 2 + 6, T + ph + 16, html.escape(lab)))
+    else:
+        o.append('<text x="%d" y="%d" fill="%s" text-anchor="middle" font-family="Arial">No data</text>'
+                 % (w // 2, h // 2, MUTED))
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+def pie_svg(title, data, w=760, h=440):
+    o = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">' % (w, h, w, h),
+         '<rect width="100%%" height="100%%" fill="%s"/>' % BG,
+         '<text x="%d" y="28" fill="%s" font-family="Arial" font-size="18" text-anchor="middle">%s</text>'
+         % (w // 2, FG, html.escape(title))]
+    total = sum(v for _, v in data)
+    if total:
+        cx, cy, r = 250, 240, 150
+        ang = -math.pi / 2
+        for i, (lab, v) in enumerate(data):
+            col = PALETTE[i % len(PALETTE)]
+            if len(data) == 1:
+                o.append('<circle cx="%d" cy="%d" r="%d" fill="%s"/>' % (cx, cy, r, col))
+            else:
+                a2 = ang + 2 * math.pi * v / total
+                x1, y1 = cx + r * math.cos(ang), cy + r * math.sin(ang)
+                x2, y2 = cx + r * math.cos(a2), cy + r * math.sin(a2)
+                o.append('<path d="M%d,%d L%.1f,%.1f A%d,%d 0 %d 1 %.1f,%.1f Z" fill="%s" stroke="%s"/>'
+                         % (cx, cy, x1, y1, r, r, 1 if a2 - ang > math.pi else 0, x2, y2, col, BG))
+                ang = a2
+            o.append('<rect x="480" y="%d" width="14" height="14" fill="%s"/>' % (80 + i * 26, col))
+            o.append('<text x="502" y="%d" fill="%s" font-size="13" font-family="Arial">%s - %d (%.0f%%)</text>'
+                     % (92 + i * 26, FG, html.escape(lab), v, 100.0 * v / total))
+    else:
+        o.append('<text x="%d" y="%d" fill="%s" text-anchor="middle" font-family="Arial">No data</text>'
+                 % (w // 2, h // 2, MUTED))
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+def chart_png(kind, data, title, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 4.8), dpi=130)
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(PANEL)
+    ax.set_title(title, color=FG)
+    if data:
+        labels, vals = [d[0] for d in data], [d[1] for d in data]
+        if kind == "bar":
+            ax.bar(labels, vals, color=PALETTE[:len(vals)] * 2)
+            ax.tick_params(colors=FG)
+            plt.setp(ax.get_xticklabels(), rotation=40, ha="right")
+        else:
+            ax.pie(vals, labels=labels, colors=PALETTE, textprops={"color": FG}, autopct="%1.0f%%")
+    fig.tight_layout()
+    fig.savefig(path, facecolor=BG)
+    plt.close(fig)
+
+
+def write_chart(kind, data, title, path, canvas=None):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".svg":
+        svg = (bar_svg if kind == "bar" else pie_svg)(title, data)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(svg)
+    elif ext == ".png":
+        chart_png(kind, data, title, path)
+    elif ext in (".ps", ".eps") and canvas is not None:
+        canvas.postscript(file=path, colormode="color")
+    else:
+        raise ValueError("unsupported format '%s' (use .svg, .png or .ps)" % ext)
+
+
+# --------------------------------------------------------------- notifier ---
+class Notifier:
+    def __init__(self, store):
+        self.store = store
+
+    def _s(self):
+        return self.store.settings
+
+    def discord(self, text):
+        http_post(self._s()["discord_webhook"], {"content": text[:1900]})
+
+    def slack(self, text):
+        http_post(self._s()["slack_webhook"], {"text": text})
+
+    def gchat(self, text):
+        http_post(self._s()["gchat_webhook"], {"text": text})
+
+    def telegram(self, text):
+        s = self._s()
+        http_post("https://api.telegram.org/bot%s/sendMessage" % s["telegram_token"],
+                  {"chat_id": s["telegram_chat_id"], "text": text[:4000]})
+
+    def signal(self, text):
+        s = self._s()
+        rec = [r.strip() for r in s["signal_recipients"].split(",") if r.strip()]
+        http_post(s["signal_url"].rstrip("/") + "/v2/send",
+                  {"message": text, "number": s["signal_number"], "recipients": rec})
+
+    CHANNELS = ("discord", "slack", "gchat", "telegram", "signal")
+
+    def send(self, text, only=None):
+        errors = []
+        for ch in self.CHANNELS:
+            if only and ch != only:
+                continue
+            if self._s().get(ch + "_enabled"):
+                try:
+                    getattr(self, ch)(text)
+                except Exception as e:
+                    errors.append("%s: %s" % (ch, e))
+        return errors
+
+
+# -------------------------------------------------------------------- SOC ---
+ROLES = ("Tier1", "Tier2", "Tier3", "Lead", "Manager")
+STATUSES = ("open", "investigating", "contained", "closed")
+
+
+class SOC:
+    def __init__(self, store, touch):
+        self.store, self.touch = store, touch
+
+    def add_analyst(self, name, role="Tier1", email="", shift="day", on_call=False):
+        with self.store.lock:
+            a = {"id": self.store.next_id("analyst"), "name": name, "role": role, "email": email,
+                 "shift": shift, "on_call": bool(on_call), "active": True}
+            self.store.data["analysts"].append(a)
+            self.store.save()
+        self.touch()
+        return a
+
+    def analyst(self, aid):
+        return next((a for a in self.store.data["analysts"] if a["id"] == aid), None)
+
+    def load(self, aid):
+        return sum(1 for i in self.store.data["incidents"]
+                   if i["assignee"] == aid and i["status"] != "closed")
+
+    def pick(self, sev):
+        pool = [a for a in self.store.data["analysts"] if a["active"]]
+        oncall = [a for a in pool if a["on_call"]]
+        pool = oncall or pool
+        if SEV.get(sev, 1) >= 3:
+            senior = [a for a in pool if a["role"] in ("Tier2", "Tier3", "Lead", "Manager")]
+            pool = senior or pool
+        return min(pool, key=self.load)["id"] if pool else None
+
+    def create_incident(self, title, sev="medium", alert_id=None, assignee=None):
+        with self.store.lock:
+            inc = {"id": self.store.next_id("incident"), "title": title, "severity": sev,
+                   "status": "open", "assignee": assignee or self.pick(sev), "created": now_str(),
+                   "alert_id": alert_id, "notes": []}
+            self.store.data["incidents"].append(inc)
+            if alert_id:
+                for a in self.store.data["alerts"]:
+                    if a["id"] == alert_id:
+                        a["incident"] = inc["id"]
+            self.store.save()
+        self.touch()
+        return inc
+
+    def incident(self, iid):
+        return next((i for i in self.store.data["incidents"] if i["id"] == iid), None)
+
+    def update(self, iid, **kw):
+        with self.store.lock:
+            i = self.incident(iid)
+            if i:
+                i.update(kw)
+                self.store.save()
+        self.touch()
+
+    def add_note(self, iid, note, author="system"):
+        with self.store.lock:
+            i = self.incident(iid)
+            if i:
+                i["notes"].append({"time": now_str(), "author": author, "text": note})
+                self.store.save()
+        self.touch()
+
+    def name(self, aid):
+        a = self.analyst(aid)
+        return a["name"] if a else "unassigned"
+
+
+# ----------------------------------------------------------------- engine ---
+class Engine:
+    def __init__(self, store=None):
+        self.store = store or Store()
+        self.notifier = Notifier(self.store)
+        self.version = 0
+        self.logq = queue.Queue()
+        self.soc = SOC(self.store, self.touch)
+        self.series = {}          # key -> deque[(ts, value)]
+        self.cusums = {}
+        self.cp_marks = {}        # key -> list of (ts, direction)
+        self.cooldown = {}
+        self.fail_streak = {}
+        self.was_up = {}
+        self.stop_evt = threading.Event()
+        self.mon_thread = None
+        self.cycle = 0
+        self.web = None
+        self.bridges = None
+
+    # --- plumbing
+    def touch(self):
+        self.version += 1
+
+    def log(self, msg):
+        line = "[%s] %s" % (datetime.datetime.now().strftime("%H:%M:%S"), msg)
+        self.logq.put(line)
+
+    @property
+    def monitoring(self):
+        return bool(self.mon_thread and self.mon_thread.is_alive())
+
+    # --- targets
+    def add_targets(self, text, label="", critical=False):
+        added = []
+        with self.store.lock:
+            have = {t["ip"] for t in self.store.data["targets"]}
+            for ip in parse_targets(text):
+                if ip not in have:
+                    self.store.data["targets"].append(
+                        {"ip": ip, "label": label, "critical": critical, "added": now_str()})
+                    added.append(ip)
+            self.store.save()
+        self.touch()
+        self.log("Added %d target(s)" % len(added))
+        return added
+
+    def remove_target(self, ip):
+        with self.store.lock:
+            d = self.store.data
+            d["targets"] = [t for t in d["targets"] if t["ip"] != ip]
+            d["scans"].pop(ip, None)
+            d["baseline"].pop(ip, None)
+            self.store.save()
+        self.touch()
+
+    def set_critical(self, ip, value):
+        with self.store.lock:
+            for t in self.store.data["targets"]:
+                if t["ip"] == ip:
+                    t["critical"] = bool(value)
+            self.store.save()
+        self.touch()
+
+    def ips(self):
+        return [t["ip"] for t in self.store.data["targets"]]
+
+    # --- scanning
+    def scan(self, ip, progress=None, stop=None, diff=True):
+        s = self.store.settings
+        ports = parse_ports(s["ports"])
+        self.log("Scanning %s (%d ports)..." % (ip, len(ports)))
+        res = scan_host(ip, ports, float(s["timeout"]), int(s["threads"]), progress, stop)
+        with self.store.lock:
+            self.store.data["scans"][ip] = {"time": now_str(), "open": res}
+            base = self.store.data["baseline"].get(ip)
+            if base is None:
+                self.store.data["baseline"][ip] = [r["port"] for r in res]
+            self.store.save()
+        self.touch()
+        self.log("Scan of %s done: %d open port(s)" % (ip, len(res)))
+        if diff and base is not None:
+            for r in res:
+                if r["port"] not in base:
+                    self.raise_alert("high" if r["risk"] >= 8 else "medium", "new-open-port", ip,
+                                     "New open port %d/%s (risk %d) not in baseline" %
+                                     (r["port"], r["service"], r["risk"]))
+        return res
+
+    def scan_all(self, progress=None, stop=None):
+        for ip in self.ips():
+            if stop is not None and stop.is_set():
+                break
+            self.scan(ip, progress, stop)
+
+    def reset_baseline(self, ip=None):
+        with self.store.lock:
+            for h, sc in self.store.data["scans"].items():
+                if ip is None or h == ip:
+                    self.store.data["baseline"][h] = [p["port"] for p in sc["open"]]
+            self.store.save()
+        self.touch()
+
+    # --- alerts
+    def raise_alert(self, sev, kind, target, msg):
+        s = self.store.settings
+        key = (kind, target)
+        t = time.time()
+        if t - self.cooldown.get(key, 0) < float(s["alert_cooldown"]):
+            return None
+        self.cooldown[key] = t
+        with self.store.lock:
+            a = {"id": self.store.next_id("alert"), "time": now_str(), "severity": sev,
+                 "kind": kind, "target": target, "message": msg, "incident": None, "ack": False}
+            self.store.data["alerts"].append(a)
+            self.store.data["alerts"] = self.store.data["alerts"][-2000:]
+            self.store.save()
+        self.log("ALERT [%s] %s %s: %s" % (sev.upper(), kind, target, msg))
+        if s.get("auto_incident") and SEV[sev] >= 3:
+            self.soc.create_incident("%s on %s" % (kind, target), sev, a["id"])
+        if SEV[sev] >= SEV.get(s["min_notify_severity"], 2):
+            threading.Thread(target=self._notify, daemon=True,
+                             args=("nuE ALERT [%s] %s | %s | %s" % (sev.upper(), kind, target, msg),)).start()
+        self.touch()
+        return a
+
+    def _notify(self, text):
+        for e in self.notifier.send(text):
+            self.log("Notify error: " + e)
+
+    # --- monitoring
+    def start_monitoring(self):
+        if self.monitoring:
+            return
+        self.stop_evt.clear()
+        self.mon_thread = threading.Thread(target=self._loop, daemon=True)
+        self.mon_thread.start()
+        self.log("Monitoring started")
+        self.touch()
+
+    def stop_monitoring(self):
+        self.stop_evt.set()
+        self.log("Monitoring stopped")
+        self.touch()
+
+    def _record(self, key, value):
+        dq = self.series.setdefault(key, deque(maxlen=720))
+        dq.append((time.time(), value))
+        return dq
+
+    def _cusum(self, key):
+        s = self.store.settings
+        if key not in self.cusums:
+            self.cusums[key] = CUSUM(float(s["cusum_k"]), float(s["cusum_h"]))
+        return self.cusums[key]
+
+    def _loop(self):
+        while not self.stop_evt.is_set():
+            t0 = time.time()
+            ips = self.ips()
+            try:
+                self._check_local_flood()
+                if ips:
+                    with ThreadPoolExecutor(max_workers=min(32, len(ips))) as ex:
+                        list(ex.map(self._check_target, ips))
+                self.cycle += 1
+                if self.cycle % max(1, int(self.store.settings["rescan_every"])) == 0:
+                    for ip in ips:
+                        if self.stop_evt.is_set():
+                            break
+                        self.scan(ip)
+            except Exception as e:  # keep monitor alive
+                self.log("Monitor error: %s" % e)
+            self.touch()
+            self.stop_evt.wait(max(1.0, float(self.store.settings["monitor_interval"]) - (time.time() - t0)))
+
+    def _probe_ports_for(self, ip):
+        sc = self.store.data["scans"].get(ip)
+        if sc and sc["open"]:
+            return [p["port"] for p in sc["open"]][:4]
+        return parse_ports(self.store.settings["probe_ports"])
+
+    def _check_target(self, ip):
+        timeout = max(1.0, float(self.store.settings["timeout"]) * 2)
+        lat = None
+        for p in self._probe_ports_for(ip):
+            r = probe_port(ip, p, timeout, grab=False)
+            if r:
+                lat = r["latency"]
+                break
+        self._record(ip, lat)
+        if lat is None:
+            self.fail_streak[ip] = self.fail_streak.get(ip, 0) + 1
+            if self.was_up.get(ip) and self.fail_streak[ip] >= 3:
+                self.raise_alert("high", "availability-loss", ip,
+                                 "Target stopped answering for %d probes (possible DoS)" % self.fail_streak[ip])
+            return
+        self.fail_streak[ip] = 0
+        self.was_up[ip] = True
+        d = self._cusum(ip).update(lat)
+        if d:
+            self.cp_marks.setdefault(ip, []).append((time.time(), d))
+            if d > 0:
+                self.raise_alert("high" if lat > 500 else "medium", "latency-change-point", ip,
+                                 "Upward latency shift detected (now %.1f ms) - possible DoS/saturation" % lat)
+            else:
+                self.log("Latency dropped on %s (change point, now %.1f ms)" % (ip, lat))
+
+    def _check_local_flood(self):
+        s = self.store.settings
+        conns = local_connections()
+        if not conns:
+            return
+        per_ip = Counter()
+        syn = 0
+        for st, lip, lport, rip, rport in conns:
+            if st == "SYN_RECV":
+                syn += 1
+            if rip and st not in ("LISTEN", "") and rip not in ("127.0.0.1", "::1", "0.0.0.0", "::"):
+                per_ip[rip] += 1
+        total = sum(per_ip.values())
+        self._record("local:connections", total)
+        self._record("local:syn_recv", syn)
+        for ip, n in per_ip.most_common(3):
+            if n >= int(s["dos_conn_per_ip"]):
+                self.raise_alert("high", "connection-flood", ip,
+                                 "%d simultaneous connections from one source (threshold %s)" %
+                                 (n, s["dos_conn_per_ip"]))
+        if syn >= int(s["dos_syn_recv"]):
+            self.raise_alert("critical", "syn-flood", "localhost",
+                             "%d half-open (SYN_RECV) connections - SYN flood indicator" % syn)
+        d = self._cusum("local:connections").update(total)
+        if d > 0:
+            self.cp_marks.setdefault("local:connections", []).append((time.time(), d))
+            self.raise_alert("medium", "connection-change-point", "localhost",
+                             "Sudden rise in inbound connection count (now %d)" % total)
+
+    # --- commands (shared by chat bots and the web app)
+    def command(self, text):
+        t = text.strip().lstrip("/")
+        t = re.sub(r"^nue[\s:]+", "", t, flags=re.I)
+        parts = t.split(None, 1)
+        if not parts:
+            return self.command("help")
+        cmd = parts[0].split("@")[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        d = self.store.data
+        try:
+            if cmd in ("help", "start"):
+                return ("nuE commands: status | targets | add <ips> | remove <ip> | scan <ip|all> | ports <ip> | "
+                        "alerts [n] | path | monitor start|stop | analysts | incidents | ack <incident id> close")
+            if cmd == "status":
+                return "nuE: %d targets, %d alerts, %d open incidents, monitoring=%s" % (
+                    len(d["targets"]), len(d["alerts"]),
+                    sum(1 for i in d["incidents"] if i["status"] != "closed"), self.monitoring)
+            if cmd == "targets":
+                return "\n".join("%s %s%s" % (t["ip"], t["label"], " [critical]" if t.get("critical") else "")
+                                 for t in d["targets"]) or "no targets"
+            if cmd == "add":
+                return "added: " + (", ".join(self.add_targets(arg)) or "nothing new")
+            if cmd == "remove":
+                self.remove_target(arg)
+                return "removed " + arg
+            if cmd == "scan":
+                ips = self.ips() if arg in ("", "all") else [arg]
+                threading.Thread(target=lambda: [self.scan(i) for i in ips], daemon=True).start()
+                return "scan started for %d target(s); results come as alerts, use 'ports <ip>'" % len(ips)
+            if cmd == "ports":
+                sc = d["scans"].get(arg)
+                if not sc:
+                    return "no scan data for " + arg
+                return "\n".join("%d/%s risk %d" % (p["port"], p["service"], p["risk"]) for p in sc["open"]) \
+                    or "no open ports"
+            if cmd == "alerts":
+                n = int(arg) if arg.isdigit() else 5
+                return "\n".join("#%d [%s] %s %s: %s" % (a["id"], a["severity"], a["kind"], a["target"], a["message"])
+                                 for a in d["alerts"][-n:]) or "no alerts"
+            if cmd == "path":
+                return format_paths(attack_paths(self.store)[0])
+            if cmd == "monitor":
+                if arg == "start":
+                    self.start_monitoring()
+                    return "monitoring started"
+                self.stop_monitoring()
+                return "monitoring stopped"
+            if cmd == "analysts":
+                return "\n".join("#%d %s (%s)%s" % (a["id"], a["name"], a["role"], " on-call" if a["on_call"] else "")
+                                 for a in d["analysts"]) or "no analysts"
+            if cmd == "incidents":
+                return "\n".join("#%d [%s] %s - %s -> %s" % (i["id"], i["severity"], i["title"], i["status"],
+                                                           self.soc.name(i["assignee"]))
+                                 for i in d["incidents"][-10:]) or "no incidents"
+            if cmd == "ack":
+                m = re.match(r"(\d+)\s+(\w+)", arg)
+                if m and m.group(2) in STATUSES:
+                    self.soc.update(int(m.group(1)), status=m.group(2))
+                    return "incident %s -> %s" % (m.group(1), m.group(2))
+                return "usage: ack <id> open|investigating|contained|closed"
+        except Exception as e:
+            return "error: %s" % e
+        return "unknown command, try 'help'"
+
+    # --- report
+    def report_html(self):
+        d = self.store.data
+        bar, pie = port_stats(self.store)
+        paths, _ = attack_paths(self.store)
+        esc = html.escape
+        rows = "".join("<tr><td>%s</td><td>%d</td><td>%s</td><td>%d</td><td>%s</td></tr>" %
+                       (esc(ip), p["port"], esc(p["service"]), p["risk"], esc(p["banner"]))
+                       for ip, sc in d["scans"].items() for p in sc["open"])
+        al = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" %
+                     (a["time"], a["severity"], esc(a["kind"]), esc(a["target"]), esc(a["message"]))
+                     for a in d["alerts"][-200:])
+        inc = "".join("<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" %
+                      (i["id"], esc(i["title"]), i["severity"], i["status"], esc(self.soc.name(i["assignee"])))
+                      for i in d["incidents"])
+        return ("<html><head><meta charset='utf-8'><title>nuE report</title><style>body{background:%s;color:%s;"
+                "font-family:Arial;margin:30px}table{border-collapse:collapse;width:100%%}td,th{border:1px solid %s;"
+                "padding:5px;font-size:13px}th{background:%s}h2{color:%s}</style></head><body><h1>nuE Security Report</h1>"
+                "<p>Generated %s</p><h2>Open ports</h2><table><tr><th>Host</th><th>Port</th><th>Service</th><th>Risk</th>"
+                "<th>Banner</th></tr>%s</table><h2>Charts</h2>%s%s<h2>Attack paths</h2><pre>%s</pre>"
+                "<h2>Alerts</h2><table><tr><th>Time</th><th>Sev</th><th>Type</th><th>Target</th><th>Message</th></tr>%s"
+                "</table><h2>Incidents</h2><table><tr><th>ID</th><th>Title</th><th>Sev</th><th>Status</th><th>Analyst</th>"
+                "</tr>%s</table></body></html>") % (BG, FG, BORDER, PANEL2, ACCENT2, now_str(), rows,
+                                                    bar_svg("Open ports", bar), pie_svg("Services", pie),
+                                                    esc(format_paths(paths)), al, inc)
+
+    def export_alerts_csv(self, path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["id", "time", "severity", "kind", "target", "message", "incident"])
+            for a in self.store.data["alerts"]:
+                w.writerow([a["id"], a["time"], a["severity"], a["kind"], a["target"], a["message"], a["incident"]])
+
+
+# -------------------------------------------------- chat bridges (inbound) ---
+class Bridges:
+    """Telegram and Signal long-poll command bridges."""
+
+    def __init__(self, engine):
+        self.e = engine
+        self.stop = threading.Event()
+        self.threads = []
+
+    def start(self):
+        s = self.e.store.settings
+        self.stop.clear()
+        if s["telegram_enabled"] and s["telegram_token"]:
+            self.threads.append(threading.Thread(target=self._telegram, daemon=True))
+        if s["signal_enabled"] and s["signal_number"]:
+            self.threads.append(threading.Thread(target=self._signal, daemon=True))
+        for t in self.threads:
+            t.start()
+        if self.threads:
+            self.e.log("Chat bridges started (%d)" % len(self.threads))
+
+    def shutdown(self):
+        self.stop.set()
+        self.threads = []
+
+    def _telegram(self):
+        off = 0
+        while not self.stop.is_set():
+            s = self.e.store.settings
+            try:
+                url = "https://api.telegram.org/bot%s/getUpdates?timeout=20&offset=%d" % (s["telegram_token"], off)
+                data = json.loads(urllib.request.urlopen(url, timeout=30).read().decode())
+                for u in data.get("result", []):
+                    off = u["update_id"] + 1
+                    m = u.get("message") or {}
+                    if str(m.get("chat", {}).get("id")) != str(s["telegram_chat_id"]):
+                        continue
+                    self.e.notifier.telegram(self.e.command(m.get("text", "")))
+            except Exception as ex:
+                self.e.log("Telegram bridge: %s" % ex)
+                self.stop.wait(10)
+
+    def _signal(self):
+        while not self.stop.is_set():
+            s = self.e.store.settings
+            allowed = {r.strip() for r in s["signal_recipients"].split(",") if r.strip()}
+            try:
+                url = "%s/v1/receive/%s" % (s["signal_url"].rstrip("/"), urllib.parse.quote(s["signal_number"]))
+                msgs = json.loads(urllib.request.urlopen(url, timeout=30).read().decode() or "[]")
+                for m in msgs:
+                    env = m.get("envelope", {})
+                    text = (env.get("dataMessage") or {}).get("message")
+                    if text and env.get("source") in allowed:
+                        self.e.notifier.signal(self.e.command(text))
+            except Exception as ex:
+                self.e.log("Signal bridge: %s" % ex)
+            self.stop.wait(5)
+
+
+# ------------------------------------------------------------ web application
+def make_handler(engine):
+    class H(BaseHTTPRequestHandler):
+        server_version = "nuE"
+
+        def log_message(self, *a):
+            pass
+
+        def _auth(self, q):
+            tok = engine.store.settings["web_token"]
+            given = (q.get("token", [""])[0] or self.headers.get("X-Nue-Token", "") or
+                     re.sub(r"^Bearer\s+", "", self.headers.get("Authorization", "")))
+            ck = self.headers.get("Cookie", "")
+            m = re.search(r"nue_token=([\w\-]+)", ck)
+            given = given or (m.group(1) if m else "")
+            return hmac.compare_digest(given, tok)
+
+        def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            if not self._auth(q):
+                return self._send(401, "<h3>nuE: token required (?token=...)</h3>")
+            ck = {"Set-Cookie": "nue_token=%s; HttpOnly; SameSite=Strict" % engine.store.settings["web_token"]}
+            if u.path == "/api/status":
+                return self._send(200, json.dumps({"targets": engine.ips(), "alerts": engine.store.data["alerts"][-50:],
+                                                   "monitoring": engine.monitoring}), "application/json")
+            if u.path == "/report":
+                return self._send(200, engine.report_html(), extra=ck)
+            self._send(200, self.dashboard(), extra=ck)
+
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(min(n, 1 << 20))
+            if not self._auth(q):
+                return self._send(401, "{}", "application/json")
+            try:
+                if u.path == "/slack":
+                    sec = engine.store.settings.get("slack_signing_secret")
+                    if sec:
+                        ts = self.headers.get("X-Slack-Request-Timestamp", "0")
+                        base = ("v0:%s:%s" % (ts, raw.decode())).encode()
+                        sig = "v0=" + hmac.new(sec.encode(), base, hashlib.sha256).hexdigest()
+                        if abs(time.time() - float(ts)) > 300 or not hmac.compare_digest(
+                                sig, self.headers.get("X-Slack-Signature", "")):
+                            return self._send(401, "{}", "application/json")
+                    form = urllib.parse.parse_qs(raw.decode())
+                    text = form.get("text", ["help"])[0]
+                    return self._send(200, json.dumps({"response_type": "ephemeral",
+                                                       "text": engine.command(text)}), "application/json")
+                if u.path == "/gchat":
+                    j = json.loads(raw or b"{}")
+                    msg = j.get("message", {})
+                    text = msg.get("argumentText") or msg.get("text") or "help"
+                    return self._send(200, json.dumps({"text": engine.command(text)}), "application/json")
+                if u.path == "/api/cmd":
+                    j = json.loads(raw or b"{}")
+                    return self._send(200, json.dumps({"reply": engine.command(j.get("text", ""))}),
+                                      "application/json")
+            except Exception as e:
+                return self._send(500, json.dumps({"error": str(e)}), "application/json")
+            self._send(404, "{}", "application/json")
+
+        def dashboard(self):
+            d = engine.store.data
+            esc = html.escape
+            bar, pie = port_stats(engine.store)
+            tr = "".join("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td></tr>" %
+                         (esc(t["ip"]), esc(t["label"]), "yes" if t.get("critical") else "",
+                          len(d["scans"].get(t["ip"], {}).get("open", []))) for t in d["targets"])
+            al = "".join("<tr><td>%s</td><td style='color:%s'>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" %
+                         (a["time"], SEV_COLOR[a["severity"]], a["severity"], esc(a["kind"]), esc(a["target"]),
+                          esc(a["message"])) for a in reversed(d["alerts"][-30:]))
+            inc = "".join("<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td></tr>" %
+                          (i["id"], esc(i["title"]), i["status"], esc(engine.soc.name(i["assignee"])))
+                          for i in d["incidents"][-20:])
+            paths, _ = attack_paths(engine.store)
+            return ("<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='10'><title>nuE</title><style>"
+                    "body{background:%s;color:%s;font-family:Segoe UI,Arial;margin:0}header{background:%s;padding:14px 24px;"
+                    "font-size:22px;font-weight:bold;border-bottom:2px solid %s}main{padding:20px;display:grid;"
+                    "grid-template-columns:1fr 1fr;gap:18px}section{background:%s;border:1px solid %s;border-radius:8px;"
+                    "padding:12px;overflow:auto}h3{margin:0 0 8px;color:%s}table{width:100%%;border-collapse:collapse}"
+                    "td,th{border-bottom:1px solid %s;padding:4px 6px;font-size:13px;text-align:left}a{color:%s}"
+                    "</style></head><body><header>nuE &nbsp;<small>Threat Monitoring - monitoring: %s - "
+                    "<a href='/report'>report</a></small></header><main>"
+                    "<section><h3>Targets</h3><table><tr><th>IP</th><th>Label</th><th>Critical</th><th>Open ports</th></tr>%s"
+                    "</table></section><section><h3>Open ports</h3>%s</section>"
+                    "<section><h3>Services</h3>%s</section><section><h3>Attack paths</h3><pre>%s</pre></section>"
+                    "<section style='grid-column:span 2'><h3>Alerts</h3><table><tr><th>Time</th><th>Sev</th><th>Type</th>"
+                    "<th>Target</th><th>Message</th></tr>%s</table></section>"
+                    "<section style='grid-column:span 2'><h3>SOC incidents</h3><table><tr><th>ID</th><th>Title</th>"
+                    "<th>Status</th><th>Analyst</th></tr>%s</table></section></main></body></html>") % (
+                BG, FG, PANEL2, ACCENT, PANEL, BORDER, ACCENT2, BORDER, ACCENT2,
+                "ON" if engine.monitoring else "off", tr, bar_svg("Open ports per service", bar, 520, 340),
+                pie_svg("Service share", pie, 520, 340), esc(format_paths(paths)), al, inc)
+    return H
+
+
+class WebApp:
+    def __init__(self, engine):
+        self.e, self.srv, self.th = engine, None, None
+
+    def start(self):
+        s = self.e.store.settings
+        self.srv = ThreadingHTTPServer((s["web_host"], int(s["web_port"])), make_handler(self.e))
+        self.th = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.th.start()
+        self.e.log("Web app: http://%s:%s/?token=%s" % (s["web_host"], s["web_port"], s["web_token"]))
+
+    def stop(self):
+        if self.srv:
+            self.srv.shutdown()
+            self.srv.server_close()
+            self.srv = None
+            self.e.log("Web app stopped")
+
+    @property
+    def running(self):
+        return self.srv is not None
+
+
+# =========================================================================== GUI
+def run_gui(engine):
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog, simpledialog
+
+    class FormDialog(tk.Toplevel):
+        def __init__(self, parent, title, fields, on_ok):
+            super().__init__(parent)
+            self.title(title)
+            self.configure(bg=BG)
+            self.transient(parent)
+            self.vars, self.on_ok = {}, on_ok
+            for r, f in enumerate(fields):
+                key, label, kind, val = f[:4]
+                opts = f[4] if len(f) > 4 else ()
+                ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=4)
+                if kind == "bool":
+                    v = tk.BooleanVar(value=bool(val))
+                    ttk.Checkbutton(self, variable=v).grid(row=r, column=1, sticky="w", padx=10)
+                elif kind == "choice":
+                    v = tk.StringVar(value=str(val))
+                    ttk.Combobox(self, textvariable=v, values=list(opts), state="readonly",
+                                 width=38).grid(row=r, column=1, padx=10)
+                else:
+                    v = tk.StringVar(value=str(val))
+                    ttk.Entry(self, textvariable=v, width=42, show="*" if kind == "secret" else "").grid(
+                        row=r, column=1, padx=10)
+                self.vars[key] = (v, kind)
+            bf = ttk.Frame(self)
+            bf.grid(row=len(fields), column=0, columnspan=2, pady=10)
+            ttk.Button(bf, text="OK", command=self.ok).pack(side="left", padx=6)
+            ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+            self.grab_set()
+
+        def ok(self):
+            out = {}
+            try:
+                for k, (v, kind) in self.vars.items():
+                    x = v.get()
+                    out[k] = int(x) if kind == "int" else float(x) if kind == "float" else x
+            except ValueError as e:
+                messagebox.showerror(APP, "Invalid value: %s" % e, parent=self)
+                return
+            try:
+                self.on_ok(out)
+            except Exception as e:
+                messagebox.showerror(APP, str(e), parent=self)
+                return
+            self.destroy()
+
+    class App(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.e = engine
+            self.title("%s - Network Threat Monitor" % APP)
+            self.geometry("1280x800")
+            self.configure(bg=BG)
+            self.scan_stop = threading.Event()
+            self.scan_busy = False
+            self.seen = -1
+            self.status = tk.StringVar(value="Ready")
+            self.chart_data = {"bar": [], "pie": []}
+            self.theme()
+            self.build_menu()
+            self.build_ui()
+            self.protocol("WM_DELETE_WINDOW", self.quit_app)
+            self.bridges = Bridges(engine)
+            engine.bridges = self.bridges
+            engine.web = WebApp(engine)
+            self.after(500, self.tick)
+            self.bind("<F5>", lambda e: self.scan_all())
+
+        # ---- theme
+        def theme(self):
+            st = ttk.Style(self)
+            st.theme_use("clam")
+            st.configure(".", background=BG, foreground=FG, fieldbackground=PANEL, bordercolor=BORDER,
+                         lightcolor=PANEL, darkcolor=PANEL, troughcolor=PANEL, font=("Segoe UI", 10))
+            st.configure("TFrame", background=BG)
+            st.configure("Card.TFrame", background=PANEL)
+            st.configure("TLabel", background=BG, foreground=FG)
+            st.configure("Card.TLabel", background=PANEL, foreground=FG)
+            st.configure("Big.TLabel", background=PANEL, foreground=ACCENT2, font=("Segoe UI", 22, "bold"))
+            st.configure("TButton", background=ACCENT, foreground="white", padding=6, borderwidth=0)
+            st.map("TButton", background=[("active", ACCENT2), ("disabled", PANEL2)])
+            st.configure("TNotebook", background=BG, borderwidth=0)
+            st.configure("TNotebook.Tab", background=PANEL, foreground=FG, padding=(14, 6))
+            st.map("TNotebook.Tab", background=[("selected", ACCENT)], foreground=[("selected", "white")])
+            st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=FG, rowheight=24,
+                         borderwidth=0)
+            st.configure("Treeview.Heading", background=PANEL2, foreground=FG, relief="flat")
+            st.map("Treeview", background=[("selected", ACCENT)])
+            st.configure("TEntry", fieldbackground=PANEL2, foreground=FG)
+            st.configure("TCombobox", fieldbackground=PANEL2, foreground=FG, background=PANEL2)
+            st.configure("TCheckbutton", background=BG, foreground=FG)
+            st.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=PANEL)
+
+        # ---- menu
+        def build_menu(self):
+            def menu(parent):
+                return tk.Menu(parent, tearoff=0, bg=PANEL, fg=FG, activebackground=ACCENT,
+                               activeforeground="white", bd=0)
+            mb = menu(self)
+            self.config(menu=mb)
+            f = menu(mb)
+            mb.add_cascade(label="File", menu=f)
+            f.add_command(label="Import targets from file...", command=self.import_targets)
+            f.add_command(label="Export targets...", command=self.export_targets)
+            f.add_separator()
+            f.add_command(label="Export alerts (CSV)...", command=self.export_alerts)
+            f.add_command(label="Export HTML report...", command=self.export_report)
+            f.add_command(label="Export charts...", command=self.export_charts)
+            f.add_separator()
+            f.add_command(label="Exit", command=self.quit_app, accelerator="Alt+F4")
+            ed = menu(mb)
+            mb.add_cascade(label="Edit", menu=ed)
+            ed.add_command(label="Add targets...", command=self.add_targets_dialog, accelerator="Ctrl+N")
+            ed.add_command(label="Remove selected target", command=self.remove_selected)
+            ed.add_command(label="Toggle critical asset", command=self.toggle_critical)
+            ed.add_separator()
+            ed.add_command(label="Clear alerts", command=self.clear_alerts)
+            self.bind("<Control-n>", lambda e: self.add_targets_dialog())
+            v = menu(mb)
+            mb.add_cascade(label="View", menu=v)
+            for i, n in enumerate(("Dashboard", "Targets", "Scan results", "Threats", "Charts", "Change points",
+                                   "Attack path", "SOC")):
+                v.add_command(label=n, command=lambda i=i: self.nb.select(i))
+            v.add_separator()
+            v.add_command(label="Refresh", command=self.refresh_all)
+            sc = menu(mb)
+            mb.add_cascade(label="Scan", menu=sc)
+            sc.add_command(label="Scan selected target", command=self.scan_selected)
+            sc.add_command(label="Scan all targets", command=self.scan_all, accelerator="F5")
+            sc.add_command(label="Stop scan", command=lambda: self.scan_stop.set())
+            sc.add_command(label="Set baseline from current scans", command=self.set_baseline)
+            mo = menu(mb)
+            mb.add_cascade(label="Monitor", menu=mo)
+            mo.add_command(label="Start monitoring", command=self.engine_start)
+            mo.add_command(label="Stop monitoring", command=self.engine_stop)
+            so = menu(mb)
+            mb.add_cascade(label="SOC", menu=so)
+            so.add_command(label="Add analyst...", command=self.add_analyst)
+            so.add_command(label="New incident...", command=self.new_incident)
+            to = menu(mb)
+            mb.add_cascade(label="Tools", menu=to)
+            to.add_command(label="Compute attack paths", command=self.compute_paths)
+            to.add_command(label="Test notifications", command=self.test_notify)
+            to.add_command(label="Start/stop web application", command=self.toggle_web)
+            to.add_command(label="Start chat bridges (Telegram/Signal)", command=self.bridges_start)
+            se = menu(mb)
+            mb.add_cascade(label="Settings", menu=se)
+            se.add_command(label="Preferences...", command=self.prefs)
+            se.add_command(label="Detection thresholds...", command=self.thresholds)
+            se.add_command(label="Integrations (Discord/Slack/Telegram/...)...", command=self.integrations)
+            se.add_command(label="Web application...", command=self.webprefs)
+            he = menu(mb)
+            mb.add_cascade(label="Help", menu=he)
+            he.add_command(label="Chat commands", command=lambda: messagebox.showinfo(APP, self.e.command("help")))
+            he.add_command(label="About", command=lambda: messagebox.showinfo(
+                APP, "%s %s\nNetwork threat monitoring platform.\nUse only on systems you are authorised to test." %
+                (APP, VERSION)))
+
+        # ---- layout
+        def make_tree(self, parent, cols, widths):
+            fr = ttk.Frame(parent)
+            tv = ttk.Treeview(fr, columns=[c[0] for c in cols], show="headings", selectmode="browse")
+            for (cid, title), w in zip(cols, widths):
+                tv.heading(cid, text=title)
+                tv.column(cid, width=w, anchor="w")
+            sb = ttk.Scrollbar(fr, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=sb.set)
+            tv.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            for sev, col in SEV_COLOR.items():
+                tv.tag_configure(sev, foreground=col)
+            return fr, tv
+
+        def build_ui(self):
+            top = ttk.Frame(self)
+            top.pack(fill="x", padx=10, pady=(8, 0))
+            ttk.Label(top, text="nuE", font=("Segoe UI", 20, "bold"), foreground=ACCENT2).pack(side="left")
+            ttk.Label(top, text="  Network Threat Monitor", foreground=MUTED).pack(side="left")
+            for txt, cmd in (("Stop", self.engine_stop), ("Start monitoring", self.engine_start),
+                             ("Scan all", self.scan_all), ("Add targets", self.add_targets_dialog)):
+                ttk.Button(top, text=txt, command=cmd).pack(side="right", padx=3)
+            self.nb = ttk.Notebook(self)
+            self.nb.pack(fill="both", expand=True, padx=10, pady=8)
+            self.tab_dashboard()
+            self.tab_targets()
+            self.tab_results()
+            self.tab_threats()
+            self.tab_charts()
+            self.tab_cp()
+            self.tab_path()
+            self.tab_soc()
+            bar = ttk.Frame(self)
+            bar.pack(fill="x", side="bottom")
+            ttk.Label(bar, textvariable=self.status, foreground=MUTED).pack(side="left", padx=10, pady=3)
+            self.pb = ttk.Progressbar(bar, length=220, mode="determinate")
+            self.pb.pack(side="right", padx=10)
+            self.nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_all())
+
+        def tab_dashboard(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="Dashboard")
+            cards = ttk.Frame(f)
+            cards.pack(fill="x", pady=8)
+            self.kpi = {}
+            for k, t in (("targets", "Targets"), ("ports", "Open ports"), ("alerts", "Alerts"),
+                         ("incidents", "Open incidents"), ("mon", "Monitoring")):
+                c = ttk.Frame(cards, style="Card.TFrame")
+                c.pack(side="left", fill="x", expand=True, padx=5, ipadx=10, ipady=6)
+                v = tk.StringVar(value="0")
+                ttk.Label(c, textvariable=v, style="Big.TLabel").pack()
+                ttk.Label(c, text=t, style="Card.TLabel").pack()
+                self.kpi[k] = v
+            ttk.Label(f, text="Activity log").pack(anchor="w", padx=5)
+            self.logbox = tk.Text(f, bg=PANEL, fg=FG, insertbackground=FG, relief="flat", height=12)
+            self.logbox.pack(fill="both", expand=True, padx=5, pady=5)
+            fr, self.dash_alerts = self.make_tree(f, [("time", "Time"), ("sev", "Severity"), ("kind", "Type"),
+                                                      ("tgt", "Target"), ("msg", "Message")],
+                                                  [140, 80, 160, 140, 600])
+            fr.pack(fill="both", expand=True, padx=5, pady=5)
+
+        def tab_targets(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="Targets")
+            bar = ttk.Frame(f)
+            bar.pack(fill="x", pady=6)
+            for t, c in (("Add targets", self.add_targets_dialog), ("Remove", self.remove_selected),
+                         ("Scan selected", self.scan_selected), ("Scan all", self.scan_all),
+                         ("Toggle critical", self.toggle_critical)):
+                ttk.Button(bar, text=t, command=c).pack(side="left", padx=3)
+            fr, self.t_tree = self.make_tree(f, [("ip", "IP address"), ("label", "Label"), ("crit", "Critical"),
+                                                 ("scan", "Last scan"), ("open", "Open ports"), ("state", "Status")],
+                                             [180, 200, 80, 170, 90, 120])
+            fr.pack(fill="both", expand=True)
+
+        def tab_results(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="Scan results")
+            fr, self.r_tree = self.make_tree(f, [("ip", "Host"), ("port", "Port"), ("svc", "Service"),
+                                                 ("risk", "Risk"), ("lat", "Latency ms"), ("ban", "Banner")],
+                                             [160, 70, 120, 60, 90, 600])
+            fr.pack(fill="both", expand=True, pady=6)
+
+        def tab_threats(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="Threats")
+            bar = ttk.Frame(f)
+            bar.pack(fill="x", pady=6)
+            ttk.Button(bar, text="Create incident from alert", command=self.incident_from_alert).pack(side="left", padx=3)
+            ttk.Button(bar, text="Acknowledge", command=self.ack_alert).pack(side="left", padx=3)
+            ttk.Button(bar, text="Clear all", command=self.clear_alerts).pack(side="left", padx=3)
+            fr, self.a_tree = self.make_tree(f, [("id", "ID"), ("time", "Time"), ("sev", "Severity"),
+                                                 ("kind", "Type"), ("tgt", "Target"), ("msg", "Message"),
+                                                 ("inc", "Incident")], [50, 140, 80, 170, 140, 560, 70])
+            fr.pack(fill="both", expand=True)
+
+        def tab_charts(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="Charts")
+            bar = ttk.Frame(f)
+            bar.pack(fill="x", pady=6)
+            ttk.Label(bar, text="Target:").pack(side="left", padx=4)
+            self.chart_sel = tk.StringVar(value="All targets")
+            self.chart_cb = ttk.Combobox(bar, textvariable=self.chart_sel, state="readonly", width=24)
+            self.chart_cb.pack(side="left")
+            self.chart_cb.bind("<<ComboboxSelected>>", lambda e: self.draw_charts())
+            ttk.Button(bar, text="Export bar chart", command=lambda: self.export_one("bar")).pack(side="left", padx=6)
+            ttk.Button(bar, text="Export pie chart", command=lambda: self.export_one("pie")).pack(side="left", padx=3)
+            ttk.Button(bar, text="Export both", command=self.export_charts).pack(side="left", padx=3)
+            cf = ttk.Frame(f)
+            cf.pack(fill="both", expand=True)
+            self.cv_bar = tk.Canvas(cf, bg=PANEL, highlightthickness=0)
+            self.cv_pie = tk.Canvas(cf, bg=PANEL, highlightthickness=0)
+            self.cv_bar.pack(side="left", fill="both", expand=True, padx=(0, 4))
+            self.cv_pie.pack(side="left", fill="both", expand=True, padx=(4, 0))
+            self.cv_bar.bind("<Configure>", lambda e: self.draw_charts())
+            self.cv_pie.bind("<Configure>", lambda e: self.draw_charts())
+
+        def tab_cp(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="Change points")
+            bar = ttk.Frame(f)
+            bar.pack(fill="x", pady=6)
+            ttk.Label(bar, text="Series:").pack(side="left", padx=4)
+            self.cp_sel = tk.StringVar()
+            self.cp_cb = ttk.Combobox(bar, textvariable=self.cp_sel, state="readonly", width=30)
+            self.cp_cb.pack(side="left")
+            self.cp_cb.bind("<<ComboboxSelected>>", lambda e: self.draw_cp())
+            ttk.Button(bar, text="Refresh", command=self.draw_cp).pack(side="left", padx=6)
+            ttk.Label(bar, text="Orange dashed lines = CUSUM change points (latency ms / connection counts)",
+                      foreground=MUTED).pack(side="left", padx=10)
+            self.cv_cp = tk.Canvas(f, bg=PANEL, highlightthickness=0)
+            self.cv_cp.pack(fill="both", expand=True)
+            self.cv_cp.bind("<Configure>", lambda e: self.draw_cp())
+
+        def tab_path(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="Attack path")
+            bar = ttk.Frame(f)
+            bar.pack(fill="x", pady=6)
+            ttk.Button(bar, text="Compute shortest exploit paths", command=self.compute_paths).pack(side="left", padx=3)
+            ttk.Label(bar, text="Mark critical assets on the Targets tab; paths run Internet -> asset.",
+                      foreground=MUTED).pack(side="left", padx=8)
+            self.path_txt = tk.Text(f, bg=PANEL, fg=FG, relief="flat", height=9, font=("Consolas", 10))
+            self.path_txt.pack(fill="x", padx=2)
+            self.cv_path = tk.Canvas(f, bg=PANEL, highlightthickness=0)
+            self.cv_path.pack(fill="both", expand=True, pady=6)
+            self.last_paths = ([], {})
+            self.cv_path.bind("<Configure>", lambda e: self.draw_path_graph())
+
+        def tab_soc(self):
+            f = ttk.Frame(self.nb)
+            self.nb.add(f, text="SOC")
+            left = ttk.Frame(f)
+            left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+            ttk.Label(left, text="Analysts").pack(anchor="w")
+            bar = ttk.Frame(left)
+            bar.pack(fill="x")
+            for t, c in (("Add", self.add_analyst), ("Toggle on-call", self.toggle_oncall),
+                         ("Toggle active", self.toggle_active), ("Delete", self.del_analyst)):
+                ttk.Button(bar, text=t, command=c).pack(side="left", padx=2, pady=4)
+            fr, self.s_tree = self.make_tree(left, [("id", "ID"), ("name", "Name"), ("role", "Role"),
+                                                    ("shift", "Shift"), ("oc", "On-call"), ("act", "Active"),
+                                                    ("load", "Open")], [40, 140, 70, 70, 60, 60, 50])
+            fr.pack(fill="both", expand=True)
+            right = ttk.Frame(f)
+            right.pack(side="left", fill="both", expand=True)
+            ttk.Label(right, text="Incidents").pack(anchor="w")
+            bar = ttk.Frame(right)
+            bar.pack(fill="x")
+            for t, c in (("New", self.new_incident), ("Assign", self.assign_incident), ("Status", self.status_incident),
+                         ("Add note", self.note_incident), ("View notes", self.view_notes)):
+                ttk.Button(bar, text=t, command=c).pack(side="left", padx=2, pady=4)
+            fr, self.i_tree = self.make_tree(right, [("id", "ID"), ("title", "Title"), ("sev", "Severity"),
+                                                     ("st", "Status"), ("who", "Analyst"), ("cr", "Created")],
+                                             [40, 220, 70, 90, 110, 130])
+            fr.pack(fill="both", expand=True)
+
+        # ---- refresh
+        def tick(self):
+            try:
+                while True:
+                    self.logbox.insert("end", self.e.logq.get_nowait() + "\n")
+                    self.logbox.see("end")
+            except queue.Empty:
+                pass
+            if self.e.version != self.seen:
+                self.seen = self.e.version
+                self.refresh_all()
+            elif self.e.monitoring and self.nb.index("current") == 5:
+                self.draw_cp()
+            self.after(1500, self.tick)
+
+        def refresh_all(self):
+            d = self.e.store.data
+            for tv in (self.dash_alerts, self.t_tree, self.r_tree, self.a_tree, self.s_tree, self.i_tree):
+                tv.delete(*tv.get_children())
+            nports = 0
+            for t in d["targets"]:
+                sc = d["scans"].get(t["ip"])
+                n = len(sc["open"]) if sc else 0
+                nports += n
+                state = "up" if self.e.was_up.get(t["ip"]) and not self.e.fail_streak.get(t["ip"]) else \
+                    ("DOWN" if self.e.fail_streak.get(t["ip"]) else "-")
+                self.t_tree.insert("", "end", iid=t["ip"], values=(
+                    t["ip"], t["label"], "yes" if t.get("critical") else "", sc["time"] if sc else "never", n, state))
+                for p in (sc["open"] if sc else []):
+                    self.r_tree.insert("", "end", values=(t["ip"], p["port"], p["service"], p["risk"],
+                                                          p["latency"], p["banner"]))
+            for a in reversed(d["alerts"][-300:]):
+                self.a_tree.insert("", "end", iid="a%d" % a["id"], tags=(a["severity"],), values=(
+                    a["id"], a["time"], a["severity"], a["kind"], a["target"], a["message"], a["incident"] or ""))
+            for a in reversed(d["alerts"][-8:]):
+                self.dash_alerts.insert("", "end", tags=(a["severity"],), values=(
+                    a["time"], a["severity"], a["kind"], a["target"], a["message"]))
+            for a in d["analysts"]:
+                self.s_tree.insert("", "end", iid="s%d" % a["id"], values=(
+                    a["id"], a["name"], a["role"], a["shift"], "yes" if a["on_call"] else "",
+                    "yes" if a["active"] else "no", self.e.soc.load(a["id"])))
+            for i in d["incidents"]:
+                self.i_tree.insert("", "end", iid="i%d" % i["id"], tags=(i["severity"],), values=(
+                    i["id"], i["title"], i["severity"], i["status"], self.e.soc.name(i["assignee"]), i["created"]))
+            openinc = sum(1 for i in d["incidents"] if i["status"] != "closed")
+            self.kpi["targets"].set(len(d["targets"]))
+            self.kpi["ports"].set(nports)
+            self.kpi["alerts"].set(len(d["alerts"]))
+            self.kpi["incidents"].set(openinc)
+            self.kpi["mon"].set("ON" if self.e.monitoring else "OFF")
+            ips = ["All targets"] + self.e.ips()
+            self.chart_cb["values"] = ips
+            keys = list(self.e.ips()) + ["local:connections", "local:syn_recv"]
+            self.cp_cb["values"] = keys
+            if not self.cp_sel.get() and keys:
+                self.cp_sel.set(keys[0])
+            self.draw_charts()
+            self.draw_cp()
+            self.status.set("Monitoring ON" if self.e.monitoring else "Idle")
+
+        # ---- targets
+        def add_targets_dialog(self):
+            def ok(v):
+                added = self.e.add_targets(v["targets"], v["label"], v["critical"])
+                self.status.set("Added %d target(s)" % len(added))
+            FormDialog(self, "Add targets", [
+                ("targets", "IPs / ranges / CIDR", "str", ""), ("label", "Label", "str", ""),
+                ("critical", "Critical asset", "bool", False)], ok)
+
+        def selected_ip(self):
+            s = self.t_tree.selection()
+            if not s:
+                messagebox.showinfo(APP, "Select a target on the Targets tab first.")
+                return None
+            return s[0]
+
+        def remove_selected(self):
+            ip = self.selected_ip()
+            if ip:
+                self.e.remove_target(ip)
+
+        def toggle_critical(self):
+            ip = self.selected_ip()
+            if ip:
+                cur = next(t for t in self.e.store.data["targets"] if t["ip"] == ip).get("critical")
+                self.e.set_critical(ip, not cur)
+
+        def import_targets(self):
+            p = filedialog.askopenfilename(title="Import targets", filetypes=[("Text", "*.txt *.csv"), ("All", "*")])
+            if p:
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        n = len(self.e.add_targets(f.read()))
+                    messagebox.showinfo(APP, "Imported %d target(s)." % n)
+                except Exception as ex:
+                    messagebox.showerror(APP, str(ex))
+
+        def export_targets(self):
+            p = filedialog.asksaveasfilename(defaultextension=".txt", initialfile="targets.txt")
+            if p:
+                with open(p, "w") as f:
+                    f.write("\n".join(self.e.ips()))
+
+        # ---- scanning
+        def scan_selected(self):
+            ip = self.selected_ip()
+            if ip:
+                self.run_scan([ip])
+
+        def scan_all(self):
+            if not self.e.ips():
+                messagebox.showinfo(APP, "Add targets first.")
+                return
+            self.run_scan(self.e.ips())
+
+        def run_scan(self, ips):
+            if self.scan_busy:
+                messagebox.showinfo(APP, "A scan is already running.")
+                return
+            self.scan_busy = True
+            self.scan_stop.clear()
+
+            def job():
+                try:
+                    for n, ip in enumerate(ips, 1):
+                        if self.scan_stop.is_set():
+                            break
+                        self.after(0, lambda ip=ip, n=n: self.status.set("Scanning %s (%d/%d)" % (ip, n, len(ips))))
+                        self.e.scan(ip, progress=lambda d, t: self.after(
+                            0, lambda: self.pb.configure(value=100.0 * d / max(1, t))), stop=self.scan_stop)
+                except Exception as ex:
+                    self.e.log("Scan error: %s" % ex)
+                finally:
+                    self.scan_busy = False
+                    self.after(0, lambda: (self.pb.configure(value=0), self.status.set("Scan finished")))
+            threading.Thread(target=job, daemon=True).start()
+
+        def set_baseline(self):
+            self.e.reset_baseline()
+            messagebox.showinfo(APP, "Baseline set from current scan results.")
+
+        # ---- monitoring
+        def engine_start(self):
+            if not self.e.ips():
+                messagebox.showinfo(APP, "Add at least one target first (local connection-flood monitoring still runs).")
+            self.e.start_monitoring()
+
+        def engine_stop(self):
+            self.e.stop_monitoring()
+
+        # ---- alerts
+        def sel_alert(self):
+            s = self.a_tree.selection()
+            return int(s[0][1:]) if s else None
+
+        def incident_from_alert(self):
+            aid = self.sel_alert()
+            if aid:
+                a = next(x for x in self.e.store.data["alerts"] if x["id"] == aid)
+                self.e.soc.create_incident("%s on %s" % (a["kind"], a["target"]), a["severity"], aid)
+
+        def ack_alert(self):
+            aid = self.sel_alert()
+            if aid:
+                for a in self.e.store.data["alerts"]:
+                    if a["id"] == aid:
+                        a["ack"] = True
+                self.e.store.save()
+                self.e.touch()
+
+        def clear_alerts(self):
+            if messagebox.askyesno(APP, "Delete all alerts?"):
+                self.e.store.data["alerts"] = []
+                self.e.store.save()
+                self.e.touch()
+
+        def export_alerts(self):
+            p = filedialog.asksaveasfilename(defaultextension=".csv", initialfile="nue_alerts.csv")
+            if p:
+                self.e.export_alerts_csv(p)
+
+        def export_report(self):
+            p = filedialog.asksaveasfilename(defaultextension=".html", initialfile="nue_report.html")
+            if p:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(self.e.report_html())
+
+        # ---- charts
+        def draw_charts(self):
+            ip = self.chart_sel.get()
+            bar, pie = port_stats(self.e.store, None if ip == "All targets" else ip)
+            self.chart_data = {"bar": bar, "pie": pie}
+            self.draw_bar(self.cv_bar, bar, "Open ports (hosts per port)")
+            self.draw_pie(self.cv_pie, pie, "Open services share")
+
+        def draw_bar(self, cv, data, title):
+            cv.delete("all")
+            W, H = cv.winfo_width() or 600, cv.winfo_height() or 400
+            cv.create_text(W / 2, 18, text=title, fill=FG, font=("Segoe UI", 12, "bold"))
+            if not data:
+                cv.create_text(W / 2, H / 2, text="No data - run a scan first", fill=MUTED)
+                return
+            mx = max(v for _, v in data)
+            L, R, T, B = 50, 20, 40, 70
+            pw, ph = W - L - R, H - T - B
+            bw = pw / len(data)
+            for g in range(5):
+                y = T + ph - ph * g / 4
+                cv.create_line(L, y, W - R, y, fill=BORDER)
+                cv.create_text(L - 8, y, text="%.0f" % (mx * g / 4), fill=MUTED, anchor="e")
+            for i, (lab, v) in enumerate(data):
+                x0, x1 = L + i * bw + bw * 0.15, L + (i + 1) * bw - bw * 0.15
+                y1 = T + ph
+                y0 = y1 - ph * v / mx
+                cv.create_rectangle(x0, y0, x1, y1, fill=PALETTE[i % len(PALETTE)], outline="")
+                cv.create_text((x0 + x1) / 2, y0 - 9, text=str(v), fill=FG)
+                cv.create_text((x0 + x1) / 2, y1 + 14, text=lab, fill=FG, angle=40 if len(data) > 6 else 0,
+                               anchor="w" if len(data) > 6 else "n", font=("Segoe UI", 8))
+
+        def draw_pie(self, cv, data, title):
+            cv.delete("all")
+            W, H = cv.winfo_width() or 600, cv.winfo_height() or 400
+            cv.create_text(W / 2, 18, text=title, fill=FG, font=("Segoe UI", 12, "bold"))
+            total = sum(v for _, v in data)
+            if not total:
+                cv.create_text(W / 2, H / 2, text="No data - run a scan first", fill=MUTED)
+                return
+            r = min(W * 0.32, H * 0.38)
+            cx, cy = W * 0.32, H / 2 + 12
+            start = 90.0
+            for i, (lab, v) in enumerate(data):
+                ext = -360.0 * v / total
+                col = PALETTE[i % len(PALETTE)]
+                if len(data) == 1:
+                    cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=col, outline=BG)
+                else:
+                    cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=start, extent=ext, fill=col, outline=BG,
+                                  style="pieslice")
+                start += ext
+                cv.create_rectangle(W * 0.64, 60 + i * 24, W * 0.64 + 12, 72 + i * 24, fill=col, outline="")
+                cv.create_text(W * 0.64 + 20, 66 + i * 24, anchor="w", fill=FG,
+                               text="%s - %d (%.0f%%)" % (lab, v, 100.0 * v / total))
+
+        def export_one(self, kind):
+            ft = [("SVG image", "*.svg"), ("PNG image (needs matplotlib)", "*.png"), ("PostScript", "*.ps")]
+            p = filedialog.asksaveasfilename(defaultextension=".svg", filetypes=ft,
+                                             initialfile="nue_%s_chart.svg" % kind)
+            if not p:
+                return
+            try:
+                write_chart(kind, self.chart_data[kind], "Open ports" if kind == "bar" else "Service share", p,
+                            self.cv_bar if kind == "bar" else self.cv_pie)
+                self.status.set("Exported " + p)
+            except Exception as ex:
+                messagebox.showerror(APP, "Export failed: %s\n(PNG needs: pip install matplotlib)" % ex)
+
+        def export_charts(self):
+            d = filedialog.askdirectory(title="Export bar + pie charts to folder")
+            if not d:
+                return
+            fmt = simpledialog.askstring(APP, "Format: svg, png or ps", initialvalue="svg") or "svg"
+            try:
+                self.draw_charts()
+                write_chart("bar", self.chart_data["bar"], "Open ports", os.path.join(d, "nue_bar.%s" % fmt), self.cv_bar)
+                write_chart("pie", self.chart_data["pie"], "Service share", os.path.join(d, "nue_pie.%s" % fmt),
+                            self.cv_pie)
+                messagebox.showinfo(APP, "Exported nue_bar.%s and nue_pie.%s" % (fmt, fmt))
+            except Exception as ex:
+                messagebox.showerror(APP, "Export failed: %s" % ex)
+
+        # ---- change points
+        def draw_cp(self):
+            cv = self.cv_cp
+            cv.delete("all")
+            W, H = cv.winfo_width() or 600, cv.winfo_height() or 400
+            key = self.cp_sel.get()
+            ser = [(t, v) for t, v in self.e.series.get(key, []) if v is not None]
+            cv.create_text(W / 2, 16, text="Series: %s" % (key or "-"), fill=FG, font=("Segoe UI", 12, "bold"))
+            if len(ser) < 2:
+                cv.create_text(W / 2, H / 2, text="Start monitoring to collect data", fill=MUTED)
+                return
+            L, R, T, B = 60, 20, 36, 30
+            ts, vs = [s[0] for s in ser], [s[1] for s in ser]
+            t0, t1 = ts[0], ts[-1]
+            lo, hi = min(vs), max(vs)
+            if hi == lo:
+                hi, lo = hi + 1, lo - 1
+
+            def X(t):
+                return L + (W - L - R) * (t - t0) / max(1e-9, t1 - t0)
+
+            def Y(v):
+                return H - B - (H - T - B) * (v - lo) / (hi - lo)
+            for g in range(5):
+                y = H - B - (H - T - B) * g / 4
+                cv.create_line(L, y, W - R, y, fill=BORDER)
+                cv.create_text(L - 6, y, text="%.1f" % (lo + (hi - lo) * g / 4), fill=MUTED, anchor="e")
+            pts = []
+            for t, v in ser:
+                pts += [X(t), Y(v)]
+            cv.create_line(*pts, fill=ACCENT2, width=2)
+            for t, d in self.e.cp_marks.get(key, []):
+                if t0 <= t <= t1:
+                    cv.create_line(X(t), T, X(t), H - B, fill="#fb923c", dash=(4, 3), width=2)
+            # offline CUSUM over the displayed window as well
+            s = self.e.store.settings
+            for i, d in change_points(vs, float(s["cusum_k"]), float(s["cusum_h"])):
+                cv.create_oval(X(ts[i]) - 4, Y(vs[i]) - 4, X(ts[i]) + 4, Y(vs[i]) + 4, fill=BADC, outline="")
+
+        # ---- attack path
+        def compute_paths(self):
+            paths, edges = attack_paths(self.e.store)
+            self.last_paths = (paths, edges)
+            self.path_txt.delete("1.0", "end")
+            self.path_txt.insert("end", format_paths(paths))
+            self.nb.select(6)
+            self.draw_path_graph()
+
+        def draw_path_graph(self):
+            cv = self.cv_path
+            cv.delete("all")
+            paths, edges = self.last_paths
+            W, H = cv.winfo_width() or 600, cv.winfo_height() or 300
+            nodes = list(edges.keys())
+            if len(nodes) < 2:
+                cv.create_text(W / 2, H / 2, text="Scan targets, then compute paths", fill=MUTED)
+                return
+            pos = {"Internet": (60, H / 2)}
+            others = [n for n in nodes if n != "Internet"]
+            for i, n in enumerate(others):
+                ang = -math.pi / 2 + 2 * math.pi * i / len(others)
+                pos[n] = (W / 2 + (W / 2 - 110) * math.cos(ang) * 0.9, H / 2 + (H / 2 - 40) * math.sin(ang))
+            hot = {(a, b) for r in paths for a, b, _ in r["path"]}
+            for a, lst in edges.items():
+                for b, w, why in lst:
+                    (x1, y1), (x2, y2) = pos[a], pos[b]
+                    col = "#fb923c" if (a, b) in hot else BORDER
+                    cv.create_line(x1, y1, x2, y2, fill=col, width=3 if (a, b) in hot else 1, arrow="last")
+            crit = {t["ip"] for t in self.e.store.data["targets"] if t.get("critical")}
+            for n, (x, y) in pos.items():
+                col = BADC if n in crit else (WARNC if n == "Internet" else ACCENT)
+                cv.create_oval(x - 14, y - 14, x + 14, y + 14, fill=col, outline=FG)
+                cv.create_text(x, y + 26, text=n, fill=FG, font=("Segoe UI", 8))
+
+        # ---- SOC
+        def add_analyst(self):
+            def ok(v):
+                if not v["name"].strip():
+                    raise ValueError("Name required")
+                self.e.soc.add_analyst(v["name"], v["role"], v["email"], v["shift"], v["on_call"])
+            FormDialog(self, "Add analyst", [
+                ("name", "Name", "str", ""), ("role", "Role", "choice", "Tier1", ROLES),
+                ("email", "Email", "str", ""), ("shift", "Shift", "choice", "day", ("day", "evening", "night")),
+                ("on_call", "On call", "bool", False)], ok)
+
+        def sel_analyst(self):
+            s = self.s_tree.selection()
+            return int(s[0][1:]) if s else None
+
+        def toggle_oncall(self):
+            a = self.e.soc.analyst(self.sel_analyst() or -1)
+            if a:
+                a["on_call"] = not a["on_call"]
+                self.e.store.save()
+                self.e.touch()
+
+        def toggle_active(self):
+            a = self.e.soc.analyst(self.sel_analyst() or -1)
+            if a:
+                a["active"] = not a["active"]
+                self.e.store.save()
+                self.e.touch()
+
+        def del_analyst(self):
+            aid = self.sel_analyst()
+            if aid and messagebox.askyesno(APP, "Delete analyst?"):
+                d = self.e.store.data
+                d["analysts"] = [a for a in d["analysts"] if a["id"] != aid]
+                for i in d["incidents"]:
+                    if i["assignee"] == aid:
+                        i["assignee"] = None
+                self.e.store.save()
+                self.e.touch()
+
+        def sel_incident(self):
+            s = self.i_tree.selection()
+            return int(s[0][1:]) if s else None
+
+        def new_incident(self):
+            names = ["auto"] + ["%d:%s" % (a["id"], a["name"]) for a in self.e.store.data["analysts"]]
+
+            def ok(v):
+                who = None if v["who"] == "auto" else int(v["who"].split(":")[0])
+                self.e.soc.create_incident(v["title"], v["sev"], assignee=who)
+            FormDialog(self, "New incident", [
+                ("title", "Title", "str", ""), ("sev", "Severity", "choice", "medium", tuple(SEV)),
+                ("who", "Assign to", "choice", "auto", names)], ok)
+
+        def assign_incident(self):
+            iid = self.sel_incident()
+            if not iid:
+                return
+            names = ["%d:%s" % (a["id"], a["name"]) for a in self.e.store.data["analysts"]]
+            FormDialog(self, "Assign incident", [("who", "Analyst", "choice", names[0] if names else "", names)],
+                       lambda v: self.e.soc.update(iid, assignee=int(v["who"].split(":")[0])))
+
+        def status_incident(self):
+            iid = self.sel_incident()
+            if iid:
+                FormDialog(self, "Incident status", [("st", "Status", "choice", "investigating", STATUSES)],
+                           lambda v: self.e.soc.update(iid, status=v["st"]))
+
+        def note_incident(self):
+            iid = self.sel_incident()
+            if iid:
+                t = simpledialog.askstring(APP, "Note:")
+                if t:
+                    self.e.soc.add_note(iid, t, "analyst")
+
+        def view_notes(self):
+            iid = self.sel_incident()
+            i = self.e.soc.incident(iid) if iid else None
+            if i:
+                messagebox.showinfo("Incident #%d" % iid, "\n".join(
+                    "%s [%s] %s" % (n["time"], n["author"], n["text"]) for n in i["notes"]) or "No notes")
+
+        # ---- settings
+        def _settings_dialog(self, title, fields):
+            s = self.e.store.settings
+            spec = [(k, lab, kind, s[k]) for k, lab, kind in fields]
+
+            def ok(v):
+                s.update(v)
+                self.e.store.save()
+                parse_ports(s["ports"])
+                self.e.touch()
+            FormDialog(self, title, spec, ok)
+
+        def prefs(self):
+            self._settings_dialog("Preferences", [
+                ("ports", "Ports to scan (e.g. 1-1024,3389)", "str"), ("timeout", "Connect timeout (s)", "float"),
+                ("threads", "Scan threads", "int"), ("monitor_interval", "Monitor interval (s)", "int"),
+                ("rescan_every", "Re-scan every N cycles", "int"), ("probe_ports", "Probe ports (if no scan)", "str"),
+                ("auto_incident", "Auto-create incidents for high/critical", "bool"),
+                ("min_notify_severity", "Min. severity to notify (low/medium/high/critical)", "str")])
+
+        def thresholds(self):
+            self._settings_dialog("Detection thresholds", [
+                ("dos_conn_per_ip", "Connections per source IP (flood)", "int"),
+                ("dos_syn_recv", "Half-open SYN_RECV count (SYN flood)", "int"),
+                ("cusum_k", "CUSUM slack k", "float"), ("cusum_h", "CUSUM threshold h", "float"),
+                ("alert_cooldown", "Alert cooldown (s)", "int")])
+
+        def integrations(self):
+            self._settings_dialog("Integrations", [
+                ("discord_enabled", "Discord enabled", "bool"), ("discord_webhook", "Discord webhook URL", "secret"),
+                ("slack_enabled", "Slack enabled", "bool"), ("slack_webhook", "Slack webhook URL", "secret"),
+                ("slack_signing_secret", "Slack signing secret (slash cmd)", "secret"),
+                ("gchat_enabled", "Google Chat enabled", "bool"), ("gchat_webhook", "Google Chat webhook URL", "secret"),
+                ("telegram_enabled", "Telegram enabled", "bool"), ("telegram_token", "Telegram bot token", "secret"),
+                ("telegram_chat_id", "Telegram chat id", "str"),
+                ("signal_enabled", "Signal enabled", "bool"), ("signal_url", "signal-cli-rest-api URL", "str"),
+                ("signal_number", "Signal sender number", "str"),
+                ("signal_recipients", "Signal recipients (comma)", "str")])
+
+        def webprefs(self):
+            self._settings_dialog("Web application", [
+                ("web_host", "Bind host (0.0.0.0 for LAN)", "str"), ("web_port", "Port", "int"),
+                ("web_token", "Access token", "str")])
+
+        def test_notify(self):
+            errs = self.e.notifier.send("nuE test notification %s" % now_str())
+            messagebox.showinfo(APP, "Test sent." if not errs else "Errors:\n" + "\n".join(errs))
+
+        def toggle_web(self):
+            w = self.e.web
+            try:
+                if w.running:
+                    w.stop()
+                else:
+                    w.start()
+                    s = self.e.store.settings
+                    messagebox.showinfo(APP, "Web app: http://%s:%s/?token=%s" %
+                                        (s["web_host"], s["web_port"], s["web_token"]))
+            except OSError as ex:
+                messagebox.showerror(APP, str(ex))
+
+        def bridges_start(self):
+            self.bridges.shutdown()
+            self.bridges.start()
+
+        def quit_app(self):
+            self.e.stop_monitoring()
+            self.bridges.shutdown()
+            if self.e.web:
+                self.e.web.stop()
+            self.destroy()
+
+    App().mainloop()
+
+
+# =========================================================================== CLI
+def run_cli(argv):
+    ap = argparse.ArgumentParser(prog="nue", description="nuE network threat monitor (no args = GUI)")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("gui", help="open the graphical interface")
+    p = sub.add_parser("add", help="add targets (IP, range, CIDR)")
+    p.add_argument("targets", nargs="+")
+    p.add_argument("--label", default="")
+    p.add_argument("--critical", action="store_true")
+    p = sub.add_parser("remove")
+    p.add_argument("ip")
+    sub.add_parser("list", help="list targets")
+    p = sub.add_parser("scan", help="scan targets (all if none given)")
+    p.add_argument("ips", nargs="*")
+    p.add_argument("--ports", help="override port spec")
+    p = sub.add_parser("monitor", help="start threat monitoring")
+    p.add_argument("--duration", type=int, default=0, help="seconds (0 = until Ctrl+C)")
+    p.add_argument("--web", action="store_true", help="also start web app")
+    p.add_argument("--bridges", action="store_true", help="also start Telegram/Signal command bridges")
+    sub.add_parser("path", help="shortest attack paths")
+    p = sub.add_parser("chart", help="export bar/pie chart of open ports")
+    p.add_argument("--type", choices=("bar", "pie"), required=True)
+    p.add_argument("--out", required=True, help=".svg or .png")
+    p.add_argument("--ip")
+    p = sub.add_parser("web", help="run the web application")
+    p.add_argument("--port", type=int)
+    sub.add_parser("alerts")
+    p = sub.add_parser("analyst", help="manage SOC analysts")
+    p.add_argument("action", choices=("add", "list", "remove"))
+    p.add_argument("--name")
+    p.add_argument("--role", default="Tier1", choices=ROLES)
+    p.add_argument("--oncall", action="store_true")
+    p.add_argument("--id", type=int)
+    sub.add_parser("incidents")
+    p = sub.add_parser("report")
+    p.add_argument("out")
+    p = sub.add_parser("cmd", help="run a chat-style command, e.g. cmd status")
+    p.add_argument("text", nargs="+")
+    a = ap.parse_args(argv)
+
+    e = Engine()
+    if a.cmd in (None, "gui"):
+        return run_gui(e)
+    if a.cmd == "add":
+        print("added:", ", ".join(e.add_targets(" ".join(a.targets), a.label, a.critical)) or "nothing new")
+    elif a.cmd == "remove":
+        e.remove_target(a.ip)
+    elif a.cmd == "list":
+        for t in e.store.data["targets"]:
+            sc = e.store.data["scans"].get(t["ip"], {})
+            print("%-40s %-15s %s open=%d" % (t["ip"], t["label"], "CRITICAL" if t.get("critical") else "",
+                                              len(sc.get("open", []))))
+    elif a.cmd == "scan":
+        if a.ports:
+            e.store.settings["ports"] = a.ports
+        ips = a.ips or e.ips()
+        for ip in ips:
+            if ip not in e.ips():
+                e.add_targets(ip)
+            for r in e.scan(ip):
+                print("%-40s %5d/tcp %-14s risk=%d  %s" % (ip, r["port"], r["service"], r["risk"], r["banner"]))
+    elif a.cmd == "monitor":
+        if a.web:
+            e.web = WebApp(e)
+            e.web.start()
+        if a.bridges:
+            Bridges(e).start()
+        e.start_monitoring()
+        t0 = time.time()
+        try:
+            while not a.duration or time.time() - t0 < a.duration:
+                try:
+                    while True:
+                        print(e.logq.get(timeout=1))
+                except queue.Empty:
+                    pass
+        except KeyboardInterrupt:
+            pass
+        e.stop_monitoring()
+        while not e.logq.empty():
+            print(e.logq.get())
+    elif a.cmd == "path":
+        print(format_paths(attack_paths(e.store)[0]))
+    elif a.cmd == "chart":
+        bar, pie = port_stats(e.store, a.ip)
+        write_chart(a.type, bar if a.type == "bar" else pie,
+                    "Open ports" if a.type == "bar" else "Service share", a.out)
+        print("written", a.out)
+    elif a.cmd == "web":
+        if a.port:
+            e.store.settings["web_port"] = a.port
+        w = WebApp(e)
+        w.start()
+        print(e.logq.get())
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            w.stop()
+    elif a.cmd == "alerts":
+        for x in e.store.data["alerts"][-50:]:
+            print("#%d %s [%s] %s %s: %s" % (x["id"], x["time"], x["severity"], x["kind"], x["target"], x["message"]))
+    elif a.cmd == "analyst":
+        if a.action == "add":
+            print(e.soc.add_analyst(a.name or "analyst", a.role, on_call=a.oncall))
+        elif a.action == "remove":
+            e.store.data["analysts"] = [x for x in e.store.data["analysts"] if x["id"] != a.id]
+            e.store.save()
+        else:
+            print(e.command("analysts"))
+    elif a.cmd == "incidents":
+        print(e.command("incidents"))
+    elif a.cmd == "report":
+        with open(a.out, "w", encoding="utf-8") as f:
+            f.write(e.report_html())
+        print("written", a.out)
+    elif a.cmd == "cmd":
+        print(e.command(" ".join(a.text)))
+
+
+if __name__ == "__main__":
+    run_cli(sys.argv[1:])
